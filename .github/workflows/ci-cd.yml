@@ -1,58 +1,229 @@
+# template/ci-pipeline-template.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable GitHub Actions CI/CD pipeline template for THC tenant applications.
+# Test 2
+# USAGE — Copy this file to your application repository as:
+#   .github/workflows/ci-cd.yml
+#
+# Then set the following GitHub Actions secrets in your application repo:
+#   HARBOR_ROBOT_USER      — Harbor robot account username (from onboard-tenant-cicd.sh)
+#   HARBOR_ROBOT_TOKEN     — Harbor robot account token
+#   GITOPS_DEPLOY_KEY      — SSH deploy key with write access to transhybrid/thc-gitops
+#   DB_HOST                — (optional) for integration tests
+#
+# REQUIRED repo variables (Settings → Variables):
+#   TENANT_NAME            — e.g. "finance" (the name of the .yaml file in gitops)
+#   HARBOR_URL             — harbor.transhybrid.net.id
+#   HARBOR_PROJECT         — e.g. "it" (the project namespace in Harbor)
+# ─────────────────────────────────────────────────────────────────────────────
+
 name: CI/CD Pipeline
+
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+      - dev
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_site:
+        description: "Deploy to site (both | site-a | site-b)"
+        required: false
+        default: "both"
+
+env:
+  HARBOR_URL: ${{ vars.HARBOR_URL }}
+  TENANT: ${{ vars.TENANT_NAME }}
+  IMAGE_NAME: ${{ vars.HARBOR_URL }}/${{ vars.HARBOR_PROJECT }}/${{ github.event.repository.name }}
+
 jobs:
-  build-and-push:
-    runs-on: self-hosted
+  # ── Lint & Test ────────────────────────────────────────────────
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v2
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up environment
+        # Adjust for your language/framework. Example shown for Node.js.
+        run: |
+          echo "Setting up language runtime..."
+          # node: npm ci
+          # python: pip install -r requirements.txt
+          # go: go mod download
+
+      - name: Lint
+        run: |
+          echo "Running linter..."
+          # node: npm run lint
+          # python: ruff check .
+          # go: golangci-lint run
+
+      - name: Unit tests
+        run: |
+          echo "Running unit tests..."
+          # node: npm test
+          # python: pytest tests/unit
+          # go: go test ./...
+
+  # ── Build & Push ───────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    needs: test
+    runs-on: ubuntu-latest
+    # Only build on push to main/release, not on PRs
+    if: github.event_name != 'pull_request'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          BRANCH="${GITHUB_REF_NAME//\//-}"   # Replace / with -
+          TAG="${BRANCH}-${SHORT_SHA}"
+          echo "image_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${TAG}"
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.CR_PAT }}
+          registry: ${{ env.HARBOR_URL }}
+          username: ${{ secrets.HARBOR_ROBOT_USER }}
+          password: ${{ secrets.HARBOR_ROBOT_TOKEN }}
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
-      - name: Update GitOps repository
-        shell: bash
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}
+            ${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.run_id }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          provenance: false # Disable attestations; Harbor does not require them
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}"
+          format: "table"
+          exit-code: "1" # Fail pipeline on CRITICAL vulnerabilities
+          severity: "CRITICAL"
+          ignore-unfixed: true
+
+  # ── Deploy to GitOps ───────────────────────────────────────────
+  deploy:
+    name: Update GitOps repo
+    needs: build
+    runs-on: ubuntu-latest # Use GitHub-hosted runner for git operations
+    strategy:
+      matrix:
+        site: [site-a, site-b] # Site B config is prepared and ready, deployment remains disabled during maintenance
+      fail-fast: false # Deploy to both sites even if one fails
+
+    steps:
+      - name: Checkout GitOps repo
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.deploy_site == 'both' || github.event.inputs.deploy_site == matrix.site
+        uses: actions/checkout@v4
+        with:
+          repository: transhybrid/thc-gitops
+          ref: main
+          token: ${{ secrets.GIT_PUSH_TOKEN }}
+          path: thc-gitops
+
+      - name: Update image tag in values overlay
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.deploy_site == 'both' || github.event.inputs.deploy_site == matrix.site
         env:
-          GIT_TOKEN: ${{ secrets.GITOPS_PAT }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          SITE: ${{ matrix.site }}
         run: |
-          # Configure git credential store
-          git config --global credential.helper store
-          echo "https://${GIT_TOKEN}:x-oauth-basic@github.com" > ~/.git-credentials
-          
-          # Remove any existing gitops directory
-          rm -rf gitops
-          
-          # Clone repository using HTTPS URL without token
-          git clone https://github.com/rslim087a/grade-api-gitops.git gitops
-          cd gitops
-          
-          if [[ "$OSTYPE" == "darwin"* ]]; then
-            sed -i '' "s|image: ghcr.io/${{ github.repository }}:.*|image: ghcr.io/${{ github.repository }}:${{ github.sha }}|g" deployment.yaml
+          VALUES_FILE="thc-gitops/environments/${SITE}/tenants/${TENANT}.yaml"
+          PROD_VALUES_FILE="thc-gitops/environments/${SITE}/tenants/${TENANT}-prod.yaml"
+
+          TARGET_FILES=()
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            TARGET_FILES+=("${PROD_VALUES_FILE}")
+          elif [[ "${GITHUB_REF_NAME}" == "dev" ]]; then
+            TARGET_FILES+=("${VALUES_FILE}")
           else
-            sed -i "s|image: ghcr.io/${{ github.repository }}:.*|image: ghcr.io/${{ github.repository }}:${{ github.sha }}|g" deployment.yaml
+            echo "Skipping GitOps value update for branch: ${GITHUB_REF_NAME}"
+            exit 0
           fi
-          
-          # Commit changes
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          git add deployment.yaml
-          git commit -m "Update image to ${{ github.sha }}"
-          
-          # Push
-          git push -f https://${GIT_TOKEN}@github.com/rslim087a/grade-api-gitops.git main
+
+          for f in "${TARGET_FILES[@]}"; do
+            if [[ ! -f "${f}" ]]; then
+              echo "ERROR: Values file not found: ${f}"
+              exit 1
+            fi
+          done
+
+          # Update the image.tag field in the YAML file
+          # Uses yq if available, falls back to sed
+          if command -v yq &>/dev/null; then
+            for f in "${TARGET_FILES[@]}"; do
+              yq e ".image.tag = \"${IMAGE_TAG}\"" -i "${f}"
+            done
+          else
+            for f in "${TARGET_FILES[@]}"; do
+              sed -i "s|^\(\s*tag:\s*\).*|\1${IMAGE_TAG}|" "${f}"
+            done
+          fi
+
+          for f in "${TARGET_FILES[@]}"; do
+            echo "Updated ${f} -> image.tag: ${IMAGE_TAG}"
+            cat "${f}"
+          done
+
+      - name: Commit and push
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.deploy_site == 'both' || github.event.inputs.deploy_site == matrix.site
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          SITE: ${{ matrix.site }}
+        run: |
+          cd thc-gitops
+          git config user.name  "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            git add "environments/${SITE}/tenants/${TENANT}-prod.yaml"
+          elif [[ "${GITHUB_REF_NAME}" == "dev" ]]; then
+            git add "environments/${SITE}/tenants/${TENANT}.yaml"
+          else
+            echo "Skipping commit for branch: ${GITHUB_REF_NAME}"
+            exit 0
+          fi
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit (tag already up to date)"
+            exit 0
+          fi
+
+          git commit -m "chore(${TENANT}/${SITE}): deploy ${IMAGE_TAG}
+
+          Triggered by: ${{ github.repository }}@${{ github.sha }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Retry push up to 3 times to handle concurrent commits
+          for attempt in 1 2 3; do
+            git pull --rebase origin main && git push && break
+            echo "Push attempt ${attempt} failed, retrying..."
+            sleep 5
+          done
